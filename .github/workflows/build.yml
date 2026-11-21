@@ -1,0 +1,408 @@
+# OpenGate. Эта строка-комментарий защищает файл от лишнего пробела в начале при вставке с телефона.
+name: Build OpenGate
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Create project files
+        shell: bash
+        run: |
+          mkdir -p OpenGate OpenGate/ui
+          cat > OpenGate/OpenGate.csproj <<'EOF_FILE'
+          <Project Sdk="Microsoft.NET.Sdk">
+
+            <PropertyGroup>
+              <OutputType>WinExe</OutputType>
+              <TargetFramework>net8.0-windows</TargetFramework>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <UseWindowsForms>true</UseWindowsForms>
+              <ApplicationManifest>app.manifest</ApplicationManifest>
+              <AssemblyName>OpenGate</AssemblyName>
+              <RootNamespace>OpenGate</RootNamespace>
+              <Version>0.1.0</Version>
+              <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+              <DebugType>none</DebugType>
+            </PropertyGroup>
+
+            <ItemGroup>
+              <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+              <Content Include="ui\**\*" CopyToOutputDirectory="PreserveNewest" />
+            </ItemGroup>
+
+          </Project>
+          EOF_FILE
+          cat > OpenGate/app.manifest <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="OpenGate.app" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+              <security>
+                <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+                  <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+                </requestedPrivileges>
+              </security>
+            </trustInfo>
+            <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+              <application>
+                <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+              </application>
+            </compatibility>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+                <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+              </windowsSettings>
+            </application>
+          </assembly>
+          EOF_FILE
+          cat > OpenGate/Program.cs <<'EOF_FILE'
+          namespace OpenGate;
+
+          static class Program
+          {
+              [STAThread]
+              static void Main()
+              {
+                  using var mutex = new Mutex(true, "OpenGate.SingleInstance", out bool created);
+                  if (!created)
+                  {
+                      MessageBox.Show("OpenGate уже запущен. Посмотри в панели задач.", "OpenGate");
+                      return;
+                  }
+                  ApplicationConfiguration.Initialize();
+                  Application.Run(new MainForm());
+              }
+          }
+          EOF_FILE
+          cat > OpenGate/Paths.cs <<'EOF_FILE'
+          namespace OpenGate;
+
+          /// <summary>Где программа хранит свои файлы. Всё лежит в %LocalAppData%\OpenGate.</summary>
+          static class Paths
+          {
+              public static readonly string Root = Path.Combine(
+                  Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenGate");
+
+              public static string Lists => Path.Combine(Root, "lists");
+              public static string WebData => Path.Combine(Root, "webview");
+              public static string Ui => Path.Combine(AppContext.BaseDirectory, "ui");
+
+              public static void EnsureDirs()
+              {
+                  Directory.CreateDirectory(Root);
+                  Directory.CreateDirectory(Lists);
+                  Directory.CreateDirectory(WebData);
+              }
+          }
+          EOF_FILE
+          cat > OpenGate/ExclusionFiles.cs <<'EOF_FILE'
+          using System.Text;
+          using System.Text.RegularExpressions;
+
+          namespace OpenGate;
+
+          /// <summary>
+          /// Пишет файлы исключений для winws: exclude-hosts.txt (--hostlist-exclude)
+          /// и exclude-ips.txt (--ipset-exclude). Любую строку, которая не похожа на домен
+          /// или IP-адрес, выбрасывает: так в файл не попадёт мусор, который сломает запуск.
+          /// </summary>
+          static class ExclusionFiles
+          {
+              static readonly Regex Host = new(@"^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$", RegexOptions.Compiled);
+              static readonly Regex Ip4 = new(@"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$", RegexOptions.Compiled);
+              static readonly Regex Ip6 = new(@"^[0-9a-f:]{2,39}(/\d{1,3})?$", RegexOptions.Compiled);
+
+              public static string HostsPath => Path.Combine(Paths.Lists, "exclude-hosts.txt");
+              public static string IpsPath => Path.Combine(Paths.Lists, "exclude-ips.txt");
+
+              public static (int Hosts, int Ips) Save(string hostsText, string ipsText)
+              {
+                  var hosts = Clean(hostsText, l => l.Length <= 253 && Host.IsMatch(l));
+                  var ips = Clean(ipsText, l => Ip4.IsMatch(l) || (l.Contains(':') && Ip6.IsMatch(l)));
+                  Paths.EnsureDirs();
+                  WriteAtomic(HostsPath, hosts);
+                  WriteAtomic(IpsPath, ips);
+                  return (hosts.Count, ips.Count);
+              }
+
+              static List<string> Clean(string text, Func<string, bool> accept) =>
+                  text.Split('\n')
+                      .Select(l => l.Trim().ToLowerInvariant())
+                      .Where(l => l.Length > 0 && accept(l))
+                      .Distinct()
+                      .ToList();
+
+              // Сначала пишем во временный файл, потом подменяем: так winws никогда не прочтёт половину файла.
+              static void WriteAtomic(string path, List<string> lines)
+              {
+                  string content = lines.Count == 0 ? "" : string.Join("\n", lines) + "\n";
+                  string tmp = path + ".tmp";
+                  File.WriteAllText(tmp, content, new UTF8Encoding(false));
+                  File.Move(tmp, path, true);
+              }
+          }
+          EOF_FILE
+          cat > OpenGate/Report.cs <<'EOF_FILE'
+          using System.Diagnostics;
+          using System.Runtime.InteropServices;
+          using System.Security.Principal;
+          using System.Text.RegularExpressions;
+          using Microsoft.Web.WebView2.Core;
+
+          namespace OpenGate;
+
+          /// <summary>Текстовый отчёт о компьютере. Человек нажимает кнопку и отправляет текст тому, кто чинит.</summary>
+          static class Report
+          {
+              public static string Build()
+              {
+                  var v = Environment.OSVersion.Version;
+                  string win = v.Build >= 22000 ? "Windows 11" : "Windows 10";
+                  var lines = new List<string>
+                  {
+                      "OpenGate " + (typeof(Report).Assembly.GetName().Version?.ToString(3) ?? "?"),
+                      $"{win}, сборка {v.Build}, {RuntimeInformation.OSArchitecture}",
+                      "Права администратора: " + (IsAdmin() ? "да" : "нет"),
+                      "WebView2: " + WebView2Version(),
+                      "Метки времени TCP (нужны стратегиям с ts): " + TcpTimestamps(),
+                      "winws запущен: " + (Process.GetProcessesByName("winws").Length > 0 ? "да" : "нет"),
+                      "Файлы исключений: " + Describe(ExclusionFiles.HostsPath) + "; " + Describe(ExclusionFiles.IpsPath),
+                      "Время отчёта: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                  };
+                  return string.Join(Environment.NewLine, lines);
+              }
+
+              static bool IsAdmin()
+              {
+                  try { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+                  catch { return false; }
+              }
+
+              static string WebView2Version()
+              {
+                  try { return CoreWebView2Environment.GetAvailableBrowserVersionString(); }
+                  catch { return "не найден"; }
+              }
+
+              static string Describe(string path)
+              {
+                  try
+                  {
+                      if (!File.Exists(path)) return Path.GetFileName(path) + " нет";
+                      int n = File.ReadAllLines(path).Length;
+                      return $"{Path.GetFileName(path)} {n} строк";
+                  }
+                  catch { return Path.GetFileName(path) + " не читается"; }
+              }
+
+              static string TcpTimestamps()
+              {
+                  try
+                  {
+                      var psi = new ProcessStartInfo("netsh", "int tcp show global")
+                      {
+                          RedirectStandardOutput = true,
+                          UseShellExecute = false,
+                          CreateNoWindow = true,
+                      };
+                      using var p = Process.Start(psi);
+                      if (p == null) return "не удалось определить";
+                      string output = p.StandardOutput.ReadToEnd();
+                      if (!p.WaitForExit(4000)) { try { p.Kill(); } catch { } }
+                      foreach (var line in output.Split('\n'))
+                      {
+                          if (!line.Contains("1323") && !line.Contains("imestamps")) continue;
+                          if (Regex.IsMatch(line, "enabled", RegexOptions.IgnoreCase)) return "включены";
+                          if (Regex.IsMatch(line, "disabled", RegexOptions.IgnoreCase)) return "выключены";
+                      }
+                  }
+                  catch { }
+                  return "не удалось определить";
+              }
+          }
+          EOF_FILE
+          cat > OpenGate/MainForm.cs <<'EOF_FILE'
+          using System.Text.Json;
+          using Microsoft.Web.WebView2.Core;
+          using Microsoft.Web.WebView2.WinForms;
+
+          namespace OpenGate;
+
+          sealed class MainForm : Form
+          {
+              static readonly Color Bg = Color.FromArgb(0xFC, 0xFA, 0xFA);
+              readonly WebView2 web = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Bg };
+
+              public MainForm()
+              {
+                  Text = "OpenGate";
+                  ClientSize = new Size(1180, 760);
+                  MinimumSize = new Size(1000, 680);
+                  StartPosition = FormStartPosition.CenterScreen;
+                  BackColor = Bg;
+                  Controls.Add(web);
+                  Load += async (_, _) => await InitAsync();
+              }
+
+              async Task InitAsync()
+              {
+                  try
+                  {
+                      Paths.EnsureDirs();
+                      if (!Directory.Exists(Paths.Ui))
+                          throw new DirectoryNotFoundException("Не найдена папка ui рядом с программой: " + Paths.Ui);
+
+                      var env = await CoreWebView2Environment.CreateAsync(null, Paths.WebData);
+                      await web.EnsureCoreWebView2Async(env);
+                      var core = web.CoreWebView2;
+                      core.SetVirtualHostNameToFolderMapping("app.local", Paths.Ui, CoreWebView2HostResourceAccessKind.Allow);
+                      core.Settings.AreBrowserAcceleratorKeysEnabled = true;
+                      core.WebMessageReceived += OnMessage;
+                      core.NewWindowRequested += (_, e) => e.Handled = true;
+                      core.NavigationStarting += (_, e) =>
+                      {
+                          if (!e.Uri.StartsWith("https://app.local/", StringComparison.OrdinalIgnoreCase)) e.Cancel = true;
+                      };
+                      core.Navigate("https://app.local/index.html");
+                  }
+                  catch (Exception ex)
+                  {
+                      MessageBox.Show(
+                          "Не получилось открыть окно программы.\n\n" + ex.Message +
+                          "\n\nЕсли написано про WebView2, поставь «Microsoft Edge WebView2 Runtime» с сайта Microsoft и запусти снова.",
+                          "OpenGate", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                      Close();
+                  }
+              }
+
+              // Окно (HTML) шлёт сюда команды: { id, cmd, data }. Ответ уходит обратно с тем же id.
+              void OnMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+              {
+                  int id = 0;
+                  try
+                  {
+                      using var doc = JsonDocument.Parse(e.WebMessageAsJson);
+                      var root = doc.RootElement;
+                      id = root.GetProperty("id").GetInt32();
+                      string cmd = root.GetProperty("cmd").GetString() ?? "";
+                      root.TryGetProperty("data", out var data);
+
+                      object? result;
+                      switch (cmd)
+                      {
+                          case "exclusions.save":
+                              string hosts = data.GetProperty("hosts").GetString() ?? "";
+                              string ips = data.GetProperty("ips").GetString() ?? "";
+                              var saved = ExclusionFiles.Save(hosts, ips);
+                              result = new { hosts = saved.Hosts, ips = saved.Ips, dir = Paths.Lists };
+                              break;
+                          case "report.copy":
+                              string text = Report.Build();
+                              Clipboard.SetText(text);
+                              result = new { length = text.Length };
+                              break;
+                          default:
+                              throw new InvalidOperationException("Неизвестная команда: " + cmd);
+                      }
+                      Reply(id, true, result, null);
+                  }
+                  catch (Exception ex)
+                  {
+                      Reply(id, false, null, ex.Message);
+                  }
+              }
+
+              void Reply(int id, bool ok, object? data, string? error)
+              {
+                  string json = JsonSerializer.Serialize(new { id, ok, data, error });
+                  web.CoreWebView2.PostWebMessageAsJson(json);
+              }
+          }
+          EOF_FILE
+          cat > OpenGate/ui/index.html <<'EOF_FILE'
+          <!doctype html>
+          <html lang="ru">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>OpenGate</title>
+          <style>
+          :root {
+            --red: #E4262F;
+            --red-deep: #A80F1A;
+            --red-hot: #FF4B55;
+            --ink: #1B1B1F;
+            --muted: #76767F;
+            --ok: #1FA971;
+            --bg: #FCFAFA;
+            --hair: rgba(27, 27, 31, .08);
+            font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, "Noto Sans", "DejaVu Sans", sans-serif;
+          }
+          * { box-sizing: border-box; margin: 0; }
+          html, body { height: 100%; }
+          body { background: var(--bg); color: var(--ink); overflow: hidden; font-size: 14px; }
+          button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+          :focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+
+          /* ---------- окно ---------- */
+          .win {
+            position: relative; width: 100vw; height: 100vh;
+            display: grid; grid-template-columns: 92px 1fr; grid-template-rows: 44px 1fr;
+            background: var(--bg); overflow: hidden;
+          }
+          .blob { position: absolute; border-radius: 50%; filter: blur(46px); pointer-events: none; z-index: 0; }
+          .blob.a { width: 520px; height: 520px; left: 140px; top: -200px; background: #FF3B47; opacity: .50; }
+          .blob.b { width: 460px; height: 460px; right: -140px; top: 250px; background: #FF7A5C; opacity: .42; }
+          .blob.c { width: 560px; height: 560px; left: 8%; bottom: -300px; background: #E4262F; opacity: .40; }
+
+          .glass {
+            background: linear-gradient(180deg, rgba(255,255,255,.74), rgba(255,255,255,.46));
+            -webkit-backdrop-filter: blur(26px) saturate(1.5); backdrop-filter: blur(26px) saturate(1.5);
+            border: 1px solid rgba(255,255,255,.85);
+            box-shadow: 0 1px 0 rgba(255,255,255,.95) inset, 0 20px 44px -20px rgba(168,15,26,.30), 0 2px 6px rgba(27,27,31,.04);
+          }
+
+          /* ---------- заголовок окна ---------- */
+          .titlebar { grid-column: 1 / 3; display: flex; align-items: center; justify-content: space-between; padding-left: 16px; position: relative; z-index: 2; }
+          .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: .01em; }
+          .brand i { width: 18px; height: 18px; border-radius: 6px; background: linear-gradient(135deg, var(--red-hot), var(--red-deep)); position: relative; }
+          .brand i::after { content: ""; position: absolute; inset: 5px; border-radius: 50%; background: #fff; opacity: .92; }
+          .wc { display: flex; height: 100%; }
+          .wc span { width: 46px; display: grid; place-items: center; color: #55555d; }
+          .wc svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1.3; }
+
+          /* ---------- боковая панель ---------- */
+          .side { position: relative; z-index: 2; margin: 4px 0 16px 14px; border-radius: 28px; padding: 14px 8px; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+          .nav { width: 68px; padding: 10px 0 8px; border-radius: 18px; display: grid; justify-items: center; gap: 5px; font-size: 11px; color: var(--muted); transition: background .15s, color .15s; }
+          .nav svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+          .nav:hover { background: rgba(228,38,47,.06); }
+          .nav[aria-current="page"] { background: rgba(228,38,47,.10); color: var(--red-deep); font-weight: 600; }
+          .side .grow { flex: 1; }
+
+          /* ---------- основное ---------- */
+          main { position: relative; z-index: 1; padding: 4px 30px 24px 20px; display: grid; grid-template-rows: auto 1fr auto; gap: 16px; min-height: 0; }
+
+          /* главная карточка */
+          .hero {
+            position: relative; overflow: hidden; border-radius: 36px; padding: 30px 36px; color: #fff;
+            display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 24px; min-height: 206px;
+            background: linear-gradient(135deg, #FF4B55 0%, #DB1E29 52%, #A80F1A 100%);
+            box-shadow: 0 30px 60px -28px rgba(168,15,26,.75), 0 1px 0 rgba(255,255,255,.5) inset;
+          }
+          .hero::before { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 90% at 8% -20%, rgba(255,255,255,.42), transparent 55%); pointer-events: none; }
+          .hero::after { content: ""; position: absolute; inset: 0; border-radius: inherit; border: 1px solid rgba(255,255,255,.38); pointer-events: none; }
+          .ripples { position: absolute; right: 74px; top: 50%; width: 0; height: 0; pointer-events: none; }
+          .ripples i { position: absolute; border-radius: 50%; border: 1.5px solid rgba(255,255,255,.28); transform: translate(-50%, -50%);
